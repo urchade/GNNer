@@ -3,7 +3,6 @@ from sklearn.metrics import f1_score, precision_recall_fscore_support, classific
 import torch
 import pickle
 from utils import compute_metrics, validate, extract_spans, num_ovelap_span
-from models import GnnerAT
 
 class LightningWrapper(pl.LightningModule):
 
