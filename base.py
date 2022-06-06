@@ -9,8 +9,23 @@ from torch import nn
 from torch.nn.utils.rnn import pad_sequence
 from torch.utils.data import DataLoader
 from transformers import AutoTokenizer
+import numpy as np
 
-from utils import contruct_overlap_graph
+import networkx as nx
+
+def construct_ov_graph(max_N, batch_size, max_seg):
+    
+    spans_idx = []
+    for i in range(max_N):
+        spans_idx.extend([(i, i + j) for j in range(max_seg)])
+    
+    N = len(spans_idx)
+    G = nx.interval_graph(spans_idx)
+    # neg edges
+    neg = - nx.adjacency_matrix(G, spans_idx).todense()
+    graph = torch.from_numpy(neg + np.eye(N, N)).long()
+    graph = graph.view(1, N, N).repeat(batch_size, 1, 1)
+    return graph
 
 
 class BaseModel(nn.Module):
@@ -67,8 +82,9 @@ class BaseModel(nn.Module):
         dict_map = span_to_label(tags_2)  # dict containing 'span'->'label'
         
         # all possible spans
-        span_ids = enumerate_spans(
-            tokenized_2, max_span_width=self.max_span_width)
+        span_ids = []
+        for i in range(len(tokenized_2)):
+            span_ids.extend([(i, i + j) for j in range(self.max_span_width)])
 
         # span lengths
         span_lengths = []
@@ -79,8 +95,13 @@ class BaseModel(nn.Module):
 
         # sword boundary => span boundary
         mapping = dict(zip(range(len(subword_lenghts)), subword_lenghts))
-        subword_boundaries = list(
-            map(lambda x: (mapping[x[0]], mapping[x[1]]), span_ids))
+        
+        subword_boundaries = []
+        for idxs in span_ids:
+            try:
+                subword_boundaries.append((mapping[idxs[0]], mapping[idxs[1]]))
+            except:
+                subword_boundaries.append((0, 0))
 
         # span labels
         span_labels = torch.LongTensor(
@@ -88,14 +109,15 @@ class BaseModel(nn.Module):
         )
 
         original_spans = torch.LongTensor(span_ids)  # [num_spans, 2]
+        
+        valid_span_mask = original_spans[:, 1] > len(tokenized_2) - 1
+        
+        span_labels = span_labels.masked_fill(valid_span_mask, -1)
 
         input_ids, span_ids, span_lengths = map(torch.LongTensor, [
                                                 [i for k in tokenized for i in k], subword_boundaries, span_lengths])
 
-        # graph construction
-        inter_mask = contruct_overlap_graph(span_ids)
-
-        return {'input_ids': input_ids, 'span_ids': span_ids, 'span_lengths': span_lengths, 'span_labels': span_labels, 'inter_mask': inter_mask, 'original_spans': original_spans}
+        return {'input_ids': input_ids, 'span_ids': span_ids, 'span_lengths': span_lengths, 'span_labels': span_labels, 'original_spans': original_spans}
 
     def collate_fn(self, batch_list):
 
@@ -109,8 +131,6 @@ class BaseModel(nn.Module):
         # span mask
         span_ids = pad_sequence(
             [b['span_ids'] for b in batch], batch_first=True, padding_value=-1)
-
-        span_mask = span_ids.sum(-1) != -2
 
         span_ids = span_ids.masked_fill(span_ids == -1, 0)
 
@@ -130,18 +150,16 @@ class BaseModel(nn.Module):
             [b['span_lengths'] for b in batch], batch_first=True, padding_value=0
         )
 
-        # Interaction mask
-        graph_overlap = [b['inter_mask'] for b in batch]
-
-        max_size = max([i.size(0) for i in graph_overlap])
-
-        padded_graph = torch.zeros(len(graph_overlap), max_size, max_size)
-
-        for id, m in enumerate(graph_overlap):
-            size = m.size(0)
-            padded_graph[id, :size, :size] = m
-
-        return {'input_ids': input_ids, 'span_ids': span_ids, 'attention_mask': attention_mask, 'span_labels': span_labels, 'span_mask': span_mask, 'span_lengths': span_lengths, 'graph': padded_graph, 'original_spans': original_spans}
+        span_mask = span_labels != -1
+        
+        max_N = max([len(tokens) for tokens, tags in batch_list])
+        batch_size = len(batch_list)
+        
+        graph = construct_ov_graph(max_N, batch_size, self.max_span_width)
+        
+        graph = graph * span_mask.unsqueeze(-1)
+        
+        return {'input_ids': input_ids, 'span_ids': span_ids, 'attention_mask': attention_mask, 'span_labels': span_labels, 'span_mask': span_mask, 'span_lengths': span_lengths, 'graph': graph, 'original_spans': original_spans}
 
     def create_dataloader(self, data, **kwargs):
         return DataLoader(data, collate_fn=self.collate_fn, **kwargs)
