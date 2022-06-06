@@ -5,3 +5,4 @@ allennlp>=2.8.0
 pytorch_lightning>=1.2.7
 tqdm>=4.62.3
 numpy>=1.19.5
+networkx==3.6
